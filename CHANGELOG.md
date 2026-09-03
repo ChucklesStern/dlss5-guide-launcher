@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0-noadmin — 2026-09-03
+
+- Added a no-elevation ReShade flow that reuses an existing game-local runtime or imports a user-selected 64-bit full-add-on runtime before considering the official installer fallback.
+- Added a game-folder write preflight so access-denied failures happen before dependency downloads and before game files are changed.
+- Added targeted Windows error 5 messages for an unwritable game folder, blocked current-user storage, and a VM-blocked ReShade child installer.
+- Added a minimal game-local `ReShade.ini` when a reused/imported runtime has no adjacent configuration.
+- Kept Vulkan registry/layer setup out of the automated DX11/DX12 workflow.
+
 ## 1.2.0 — 2026-08-31
 
 - Replaced the crowded one-page form with a polished four-step dark wizard.

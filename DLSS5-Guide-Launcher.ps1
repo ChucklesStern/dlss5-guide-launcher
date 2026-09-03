@@ -15,6 +15,7 @@ param(
     [ValidateSet('Yes','No','Unsure','Auto')]
     [string]$NativeDlss = 'Auto',
     [string]$SupportFiles,
+    [string]$ReShadeRuntime,
     [switch]$AllowPatchedRtx40File
 )
 
@@ -22,7 +23,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:AppName = 'DLSS 5 Guide Launcher'
-$script:Version = '1.2.0'
+$script:Version = '1.3.0-noadmin'
 $script:AppDataRoot = Join-Path $env:LOCALAPPDATA 'DLSS5-Guide-Launcher'
 $script:CacheRoot = Join-Path $script:AppDataRoot 'Cache'
 $script:LogRoot = Join-Path $script:AppDataRoot 'Logs'
@@ -44,8 +45,17 @@ $script:LumeniteArchiveSha256 = 'fb60f9b1a1212d0a718d7ccad8f81af791560c26cc276e3
 
 function Initialize-AppStorage {
     foreach ($path in @($script:AppDataRoot, $script:CacheRoot, $script:LogRoot, $script:BackupRoot)) {
-        if (-not (Test-Path -LiteralPath $path)) {
-            New-Item -ItemType Directory -Path $path -Force | Out-Null
+        try {
+            if (-not (Test-Path -LiteralPath $path)) {
+                New-Item -ItemType Directory -Path $path -Force | Out-Null
+            }
+        }
+        catch {
+            $code = Get-NativeErrorCode $_.Exception
+            if ($code -eq 5 -or $_.Exception -is [System.UnauthorizedAccessException]) {
+                throw "Windows denied access to the launcher's current-user storage (error 5): $path`r`n`r`nThis launcher does not require or request administrator access. Ask the VM owner to allow your account to write under %LOCALAPPDATA%, or use a Windows account with a writable profile."
+            }
+            throw
         }
     }
     $script:LogPath = Join-Path $script:LogRoot ('launcher-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -178,7 +188,7 @@ function Resolve-InstallRoute {
         $unsupported = $true
         $id = 'AdvancedVulkan'
         $title = 'Advanced Feeder route: Vulkan'
-        $summary = 'Feeder supports Vulkan, but it requires ReShade''s Vulkan layer and separate placement rules. Version 1.1 of this launcher provides the official guide instead of modifying the global Vulkan layer.'
+        $summary = 'Vulkan requires a separate ReShade layer and placement model. This no-admin build does not register layers or write Vulkan registry keys; use a documented per-user/manual route outside this DX11/DX12 installer.'
     }
     elseif ($Api -eq 'DirectX 9' -and $HasNativeDlss -eq 'No') {
         $unsupported = $true
@@ -449,6 +459,113 @@ function Test-IsReShadeRuntime {
     catch { return $false }
 }
 
+function Get-NativeErrorCode {
+    param([Parameter(Mandatory=$true)][System.Exception]$Exception)
+    if ($Exception -is [System.ComponentModel.Win32Exception]) { return $Exception.NativeErrorCode }
+    if ($Exception.InnerException -is [System.ComponentModel.Win32Exception]) { return $Exception.InnerException.NativeErrorCode }
+    return ($Exception.HResult -band 0xFFFF)
+}
+
+function Assert-DirectoryWritable {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Container)) { throw "Game folder does not exist: $fullPath" }
+    $probe = Join-Path $fullPath ('.dlss5-write-check-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $stream = [System.IO.File]::Open($probe,[System.IO.FileMode]::CreateNew,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None)
+        try { $stream.WriteByte(0) } finally { $stream.Dispose() }
+        Remove-Item -LiteralPath $probe -Force
+    }
+    catch {
+        if (Test-Path -LiteralPath $probe -PathType Leaf) { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
+        $code = Get-NativeErrorCode $_.Exception
+        if ($code -eq 5 -or $_.Exception -is [System.UnauthorizedAccessException]) {
+            throw "Windows denied write access to the game folder (error 5): $fullPath`r`n`r`nNo files were changed. This no-admin launcher will not request elevation. Move/install the game in a folder your Windows account can modify, or ask the VM owner to grant your account Modify permission to this game folder."
+        }
+        throw "The launcher could not verify write access to the game folder '$fullPath': $($_.Exception.Message)"
+    }
+    Write-AppLog "Confirmed current-user write access to game folder: $fullPath" 'OK'
+}
+
+function New-DefaultReShadeIni {
+    $generatedDir = Join-Path $script:CacheRoot 'Generated'
+    if (-not (Test-Path -LiteralPath $generatedDir)) { New-Item -ItemType Directory -Path $generatedDir -Force | Out-Null }
+    $generatedPath = Join-Path $generatedDir ('ReShade-default-' + [guid]::NewGuid().ToString('N') + '.ini')
+    $lines = @(
+        '[GENERAL]',
+        'EffectSearchPaths=.\reshade-shaders\Shaders\**',
+        'PresetPath=.\ReShadePreset.ini',
+        'PreprocessorDefinitions=',
+        'TextureSearchPaths=.\reshade-shaders\Textures\**',
+        '',
+        '[ADDON]',
+        'AddonPath=.',
+        'DisabledAddons='
+    )
+    [System.IO.File]::WriteAllLines($generatedPath,[string[]]$lines,(New-Object System.Text.UTF8Encoding($false)))
+    return $generatedPath
+}
+
+function Get-LocalReShadeFiles {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$SourceMode,
+        [bool]$AlreadyInstalled = $false
+    )
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "The selected ReShade runtime was not found: $fullPath" }
+    if (-not (Test-IsReShadeRuntime $fullPath)) { throw "The selected DLL does not identify itself as ReShade: $fullPath" }
+    $architecture = Get-PeArchitecture $fullPath
+    if ($architecture -ne '64-bit') { throw "The selected ReShade runtime is $architecture; this launcher requires the 64-bit full add-on runtime." }
+    $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($fullPath)
+    $adjacentIni = Join-Path ([System.IO.Path]::GetDirectoryName($fullPath)) 'ReShade.ini'
+    $ini = if (Test-Path -LiteralPath $adjacentIni -PathType Leaf) { $adjacentIni } else { $null }
+    $preview = if ($AlreadyInstalled) { "Reuse existing ReShade runtime: $fullPath" } else { "Use selected local ReShade runtime: $fullPath" }
+    [pscustomobject]@{
+        Runtime=$fullPath
+        Ini=$ini
+        Version=[string]$info.FileVersion
+        Installer=$null
+        Url=$null
+        SourceMode=$SourceMode
+        AlreadyInstalled=$AlreadyInstalled
+        Preview=$preview
+    }
+}
+
+function Resolve-ReShadeSource {
+    param(
+        [Parameter(Mandatory=$true)][string]$GameDirectory,
+        [string]$RuntimePath,
+        [bool]$FetchRemote = $false
+    )
+    $targetDxgi = Join-Path $GameDirectory 'dxgi.dll'
+    if (Test-Path -LiteralPath $targetDxgi -PathType Leaf) {
+        if (-not (Test-IsReShadeRuntime $targetDxgi)) {
+            throw "The game already has a non-ReShade dxgi.dll. The launcher will not overwrite an unknown proxy/loader. Configure ReShade chain-loading manually for this game: $targetDxgi"
+        }
+        Write-AppLog "Reusing the existing ReShade runtime at $targetDxgi; no ReShade installer will be started." 'OK'
+        return (Get-LocalReShadeFiles -Path $targetDxgi -SourceMode 'Existing game runtime' -AlreadyInstalled $true)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RuntimePath)) {
+        $selected = Get-LocalReShadeFiles -Path $RuntimePath -SourceMode 'User-selected local runtime'
+        Write-AppLog "Using the selected local ReShade runtime at $($selected.Runtime); no ReShade installer will be started." 'OK'
+        return $selected
+    }
+    if ($FetchRemote) {
+        $staged = Get-StagedReShadeFiles
+        $staged | Add-Member -NotePropertyName SourceMode -NotePropertyValue 'Verified official fallback' -Force
+        $staged | Add-Member -NotePropertyName AlreadyInstalled -NotePropertyValue $false -Force
+        $staged | Add-Member -NotePropertyName Preview -NotePropertyValue "Verified official ReShade $($staged.Version) fallback" -Force
+        return $staged
+    }
+    [pscustomobject]@{
+        Runtime=$null; Ini=$null; Version=$script:ReShadeVersion; Installer=$null; Url=$script:ReShadeInstallerUrl
+        SourceMode='Verified official fallback'; AlreadyInstalled=$false
+        Preview="No existing/local ReShade selected; use the verified official ReShade $($script:ReShadeVersion) fallback"
+    }
+}
+
 function Get-StagedReShadeFiles {
     if ($script:PreparedReShade) { return $script:PreparedReShade }
     $installer = Get-ReShadeInstaller
@@ -469,7 +586,19 @@ function Get-StagedReShadeFiles {
     Copy-Item -LiteralPath $systemExe -Destination $stageExe -Force
     Write-AppLog "Staging the official ReShade $($script:ReShadeVersion) full add-on runtime for 64-bit DX11/DX12 (DXGI)."
     $quotedStageExe = '"' + $stageExe + '"'
-    $process = Start-Process -FilePath $installer -ArgumentList @('--headless','--api','dxgi',$quotedStageExe) -PassThru -Wait
+    try {
+        $process = Start-Process -FilePath $installer -ArgumentList @('--headless','--api','dxgi',$quotedStageExe) -PassThru -Wait
+    }
+    catch {
+        $code = Get-NativeErrorCode $_.Exception
+        if ($code -eq 5 -or $_.Exception -is [System.UnauthorizedAccessException]) {
+            throw "Windows denied permission to start the official ReShade installer (error 5): $installer`r`n`r`nThis VM blocks the child installer. No administrator access is required: select a local 64-bit ReShade full add-on runtime in the launcher, or install ReShade manually beside the game and rerun the launcher."
+        }
+        throw "The official ReShade installer could not be started: $($_.Exception.Message)"
+    }
+    if ($process.ExitCode -eq 5) {
+        throw "The official ReShade installer returned access denied (error 5): $installer`r`n`r`nSelect a local 64-bit ReShade full add-on runtime instead. This launcher will not request administrator access."
+    }
     if ($process.ExitCode -ne 0) { throw "The official ReShade installer exited with code $($process.ExitCode) while staging the DXGI runtime." }
 
     if (-not (Test-IsReShadeRuntime $runtime)) { throw 'The official ReShade installer did not produce a recognizable ReShade DXGI runtime.' }
@@ -537,15 +666,17 @@ function New-InstallPlan {
         [Parameter(Mandatory=$true)]$Route,
         [Parameter(Mandatory=$true)][string]$Gpu,
         [Parameter(Mandatory=$true)][string]$FilesRoot,
+        [string]$ReShadeRuntimePath,
         [bool]$PermitPatched40 = $false,
         [bool]$FetchRemote = $false
     )
     if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) { throw 'Select a real game executable.' }
-    if ((Get-PeArchitecture $ExePath) -ne '64-bit') { throw 'Version 1.1 of this launcher installs only 64-bit DX11/DX12 games.' }
+    if ((Get-PeArchitecture $ExePath) -ne '64-bit') { throw 'This launcher installs only 64-bit DX11/DX12 games.' }
     if (-not $Route.CanInstall) { throw $Route.Summary }
     if (-not (Test-Path -LiteralPath $FilesRoot -PathType Container)) { throw 'Select the folder containing your user-supplied RenoDX/NVIDIA support files.' }
 
     $dir = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($ExePath))
+    Assert-DirectoryWritable $dir
     $core = Find-SupportFile -Root $FilesRoot -Name 'renodx-dlss5.addon64'
     $model = Find-SupportFile -Root $FilesRoot -Name 'nvngx_dlssnr.dll'
     $upscaler = Find-SupportFile -Root $FilesRoot -Name 'nvngx_dlss.dll'
@@ -571,26 +702,21 @@ function New-InstallPlan {
     $sources = New-Object System.Collections.Generic.List[object]
     $remotePreview = New-Object System.Collections.Generic.List[string]
 
-    $stagedReShade = $null
+    $resolvedReShade = Resolve-ReShadeSource -GameDirectory $dir -RuntimePath $ReShadeRuntimePath -FetchRemote $FetchRemote
     if ($FetchRemote) {
-        $targetDxgi = Join-Path $dir 'dxgi.dll'
-        if ((Test-Path -LiteralPath $targetDxgi -PathType Leaf) -and -not (Test-IsReShadeRuntime $targetDxgi)) {
-            throw "The game already has a non-ReShade dxgi.dll. The launcher will not overwrite an unknown proxy/loader. Configure ReShade chain-loading manually for this game: $targetDxgi"
+        if (-not $resolvedReShade.AlreadyInstalled) {
+            $copies.Add([pscustomobject]@{ Source=$resolvedReShade.Runtime; Relative='dxgi.dll'; Origin="$($resolvedReShade.SourceMode): ReShade $($resolvedReShade.Version) full add-on runtime (DXGI, 64-bit)" })
         }
-        $stagedReShade = Get-StagedReShadeFiles
-        $copies.Add([pscustomobject]@{ Source=$stagedReShade.Runtime; Relative='dxgi.dll'; Origin="Official ReShade $($stagedReShade.Version) full add-on runtime (DXGI, 64-bit)" })
         foreach ($alternate in @('d3d11.dll','d3d12.dll')) {
             $alternatePath = Join-Path $dir $alternate
             if (Test-IsReShadeRuntime $alternatePath) { $removals.Add($alternate) }
         }
-        $sources.Add([pscustomobject]@{ Name='ReShade full add-on runtime'; Version=$stagedReShade.Version; Url=$stagedReShade.Url; Path=$stagedReShade.Runtime; Sha256=(Get-Sha256 $stagedReShade.Runtime) })
+        if (-not $resolvedReShade.AlreadyInstalled) {
+            $sources.Add([pscustomobject]@{ Name='ReShade full add-on runtime'; Version=$resolvedReShade.Version; Url=$resolvedReShade.Url; Path=$resolvedReShade.Runtime; Sha256=(Get-Sha256 $resolvedReShade.Runtime); SourceMode=$resolvedReShade.SourceMode })
+        }
     }
     else {
-        $remotePreview.Add("Official ReShade $($script:ReShadeVersion) full add-on runtime as dxgi.dll (64-bit DX11/DX12)")
-        $targetDxgi = Join-Path $dir 'dxgi.dll'
-        if ((Test-Path -LiteralPath $targetDxgi -PathType Leaf) -and -not (Test-IsReShadeRuntime $targetDxgi)) {
-            $remotePreview.Add('BLOCKER: existing non-ReShade dxgi.dll requires manual proxy/chain-load configuration')
-        }
+        $remotePreview.Add($resolvedReShade.Preview)
         foreach ($alternate in @('d3d11.dll','d3d12.dll')) {
             if (Test-IsReShadeRuntime (Join-Path $dir $alternate)) { $removals.Add($alternate) }
         }
@@ -637,7 +763,7 @@ function New-InstallPlan {
 
         $targetIni = Join-Path $dir 'ReShade.ini'
         if ($Route.NeedsFeeder) {
-            $iniBase = if (Test-Path -LiteralPath $targetIni -PathType Leaf) { $targetIni } else { $stagedReShade.Ini }
+            $iniBase = if (Test-Path -LiteralPath $targetIni -PathType Leaf) { $targetIni } elseif ($resolvedReShade.Ini) { $resolvedReShade.Ini } else { New-DefaultReShadeIni }
             $configuredIni = New-ConfiguredReShadeIni -SourceIniPath $iniBase
             $copies.Add([pscustomobject]@{ Source=$configuredIni; Relative='ReShade.ini'; Origin='ReShade configuration with DLSS5_MV_PROVIDER=3 and launcher preset path' })
 
@@ -662,7 +788,8 @@ function New-InstallPlan {
             $copies.Add([pscustomobject]@{ Source=$configuredPreset; Relative='ReShadePreset.ini'; Origin='Launcher preset: enable Lumenite Kernel above DLSS 5 Feed' })
         }
         elseif (-not (Test-Path -LiteralPath $targetIni -PathType Leaf)) {
-            $copies.Add([pscustomobject]@{ Source=$stagedReShade.Ini; Relative='ReShade.ini'; Origin="Official ReShade $($script:ReShadeVersion) default configuration" })
+            $iniSource = if ($resolvedReShade.Ini) { $resolvedReShade.Ini } else { New-DefaultReShadeIni }
+            $copies.Add([pscustomobject]@{ Source=$iniSource; Relative='ReShade.ini'; Origin="Configuration for $($resolvedReShade.SourceMode)" })
         }
     }
     else {
@@ -694,6 +821,8 @@ function New-InstallPlan {
         RemoteSources=@($sources | ForEach-Object { $_ })
         RemotePreview=@($remotePreview | ForEach-Object { $_ })
         ModelSignature=$modelSignature
+        ReShadeSource=$resolvedReShade.SourceMode
+        ReShadeSummary=$resolvedReShade.Preview
     }
 }
 
@@ -702,6 +831,7 @@ function Format-InstallPlan {
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add($Plan.Route.Title)
     $lines.Add('Target: ' + $Plan.GameDirectory)
+    $lines.Add('ReShade: ' + $Plan.ReShadeSummary)
     $lines.Add('')
     $lines.Add('Files to install/update:')
     foreach ($item in $Plan.Copies) { $lines.Add(('  + {0}  [{1}]' -f $item.Relative, $item.Origin)) }
@@ -728,6 +858,13 @@ function Copy-Atomically {
     try {
         Copy-Item -LiteralPath $Source -Destination $temp -Force
         Move-Item -LiteralPath $temp -Destination $Destination -Force
+    }
+    catch {
+        $code = Get-NativeErrorCode $_.Exception
+        if ($code -eq 5 -or $_.Exception -is [System.UnauthorizedAccessException]) {
+            throw "Windows denied access while writing '$Destination' (error 5). No elevation will be requested. Confirm that your Windows account can modify this game folder and that the game is closed."
+        }
+        throw
     }
     finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue } }
 }
@@ -899,6 +1036,36 @@ function Test-BackupRoundTrip {
         if (Test-Path -LiteralPath (Join-Path $gameDir 'nvngx_dlssnr.dll')) { throw 'Rollback did not remove the launcher-added model.' }
         if (-not (Test-Path -LiteralPath $manifest)) { throw 'The install manifest was not preserved.' }
         Write-AppLog 'Backup/install/rollback round-trip test passed.' 'OK'
+    }
+    finally {
+        if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Test-NoAdminHelpers {
+    $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('DLSS5-Launcher-NoAdmin-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+    try {
+        Assert-DirectoryWritable $testRoot
+        if (@(Get-ChildItem -LiteralPath $testRoot -Filter '.dlss5-write-check-*.tmp' -File).Count -ne 0) {
+            throw 'The write-access preflight left a probe file behind.'
+        }
+        $ini = New-DefaultReShadeIni
+        $text = Get-Content -LiteralPath $ini -Raw
+        foreach ($required in @('[GENERAL]','AddonPath=.','DisabledAddons=','EffectSearchPaths=.\reshade-shaders\Shaders\**')) {
+            if (-not $text.Contains($required)) { throw "Generated ReShade.ini is missing: $required" }
+        }
+        $fallback = Resolve-ReShadeSource -GameDirectory $testRoot -FetchRemote $false
+        if ($fallback.SourceMode -ne 'Verified official fallback' -or $fallback.Runtime) {
+            throw 'ReShade source resolver did not produce the expected no-download fallback preview.'
+        }
+        $fakeDxgi = Join-Path $testRoot 'dxgi.dll'
+        Set-Content -LiteralPath $fakeDxgi -Value 'not reshade' -Encoding ASCII
+        $blockedUnknownProxy = $false
+        try { Resolve-ReShadeSource -GameDirectory $testRoot -FetchRemote $false | Out-Null }
+        catch { $blockedUnknownProxy = $_.Exception.Message -match 'non-ReShade dxgi\.dll' }
+        if (-not $blockedUnknownProxy) { throw 'ReShade source resolver did not block an unknown dxgi.dll.' }
+        Write-AppLog 'No-admin write preflight and ReShade configuration tests passed.' 'OK'
     }
     finally {
         if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
@@ -1214,16 +1381,23 @@ function Show-MainWindow {
     [void](& $newLabel $fileCard 'nvngx_dlss.dll' 22 185 390 20 8.5 $false $colors.Muted)
 
     $autoCard = New-Object System.Windows.Forms.Panel
-    $autoCard.Location = New-Object System.Drawing.Point(0,390)
-    $autoCard.Size = New-Object System.Drawing.Size(802,72)
+    $autoCard.Location = New-Object System.Drawing.Point(0,386)
+    $autoCard.Size = New-Object System.Drawing.Size(802,120)
     $autoCard.BackColor = $colors.SurfaceAlt
     $pageFiles.Controls.Add($autoCard)
-    [void](& $newLabel $autoCard 'ReShade is automatic' 18 11 230 22 10 $true $colors.Success)
-    [void](& $newLabel $autoCard ("Official ReShade " + $script:ReShadeVersion + ' full add-on runtime is downloaded, verified, and installed as DXGI.') 18 36 755 23 9 $false $colors.Muted)
+    [void](& $newLabel $autoCard 'RESHade runtime (optional)' 18 10 260 22 9 $true $colors.Success)
+    $reshadeBox = New-Object System.Windows.Forms.TextBox
+    $reshadeBox.Location = New-Object System.Drawing.Point(18,39)
+    $reshadeBox.Size = New-Object System.Drawing.Size(610,28)
+    $reshadeBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    & $styleInput $reshadeBox
+    $autoCard.Controls.Add($reshadeBox)
+    $reshadeBrowse = & $newButton $autoCard 'Browse DLL' 640 35 140 36 'Secondary'
+    [void](& $newLabel $autoCard "Leave blank to reuse the game's existing ReShade dxgi.dll, or use the verified official installer fallback." 18 78 755 32 8.5 $false $colors.Muted)
     $ack40 = New-Object System.Windows.Forms.CheckBox
     $ack40.Text = 'I understand RTX 40 mode uses my own unofficial patched DLL and is not supported by NVIDIA.'
-    $ack40.Location = New-Object System.Drawing.Point(0,480)
-    $ack40.Size = New-Object System.Drawing.Size(790,44)
+    $ack40.Location = New-Object System.Drawing.Point(0,511)
+    $ack40.Size = New-Object System.Drawing.Size(790,34)
     $ack40.ForeColor = $colors.Warning
     $ack40.BackColor = $colors.Window
     $ack40.Font = New-Object System.Drawing.Font('Segoe UI Semibold',9.5)
@@ -1335,7 +1509,7 @@ function Show-MainWindow {
         $state.Analysis = [pscustomobject]@{ Exe=$fullExe; Architecture=$arch; Api=$api; Native=$native; ReShade=$rsStatus }
         $analysisHeadline.Text = [System.IO.Path]::GetFileName($fullExe) + ' is ready to review'
         $analysisHeadline.ForeColor = if ($arch -eq '64-bit') { $colors.Success } else { $colors.Danger }
-        $analysisDetail.Text = "Architecture: $arch`r`nGraphics API: $($api.Value) - $($api.Evidence)`r`nNative DLSS: $($native.Value) - $($native.Evidence)`r`nReShade: $(if ($rsStatus.Installed) { 'Installed at ' + $rsStatus.Path } else { 'Not installed yet; the launcher will add it automatically.' })"
+        $analysisDetail.Text = "Architecture: $arch`r`nGraphics API: $($api.Value) - $($api.Evidence)`r`nNative DLSS: $($native.Value) - $($native.Evidence)`r`nReShade: $(if ($rsStatus.Installed) { 'Installed at ' + $rsStatus.Path + ' (will be reused)' } else { 'Not installed; select a local runtime or use the verified fallback.' })"
         if ($arch -ne '64-bit') { throw 'This launcher currently supports only 64-bit DX11 and DX12 games.' }
         [void](& $updateRoute)
     }
@@ -1375,7 +1549,7 @@ function Show-MainWindow {
     }
     $prepareReview = {
         $route = & $updateRoute
-        $plan = New-InstallPlan -ExePath $gameBox.Text -Route $route -Gpu ([string]$gpuBox.SelectedItem) -FilesRoot $supportBox.Text -PermitPatched40 $ack40.Checked -FetchRemote $false
+        $plan = New-InstallPlan -ExePath $gameBox.Text -Route $route -Gpu ([string]$gpuBox.SelectedItem) -FilesRoot $supportBox.Text -ReShadeRuntimePath $reshadeBox.Text -PermitPatched40 $ack40.Checked -FetchRemote $false
         $state.PreviewPlan = $plan
         $reviewRoute.Text = $route.Title
         $reviewBox.Text = Format-InstallPlan $plan
@@ -1385,7 +1559,7 @@ function Show-MainWindow {
         & $setBusy $true 'Downloading and verifying the required files...'
         try {
             $route = & $updateRoute
-            $plan = New-InstallPlan -ExePath $gameBox.Text -Route $route -Gpu ([string]$gpuBox.SelectedItem) -FilesRoot $supportBox.Text -PermitPatched40 $ack40.Checked -FetchRemote $true
+            $plan = New-InstallPlan -ExePath $gameBox.Text -Route $route -Gpu ([string]$gpuBox.SelectedItem) -FilesRoot $supportBox.Text -ReShadeRuntimePath $reshadeBox.Text -PermitPatched40 $ack40.Checked -FetchRemote $true
             $previewText = Format-InstallPlan $plan
             $reviewBox.Text = $previewText
             & $setBusy $false
@@ -1423,6 +1597,13 @@ function Show-MainWindow {
         if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) { $supportBox.Text = $dialog.SelectedPath; & $refreshFileChecks }
     })
     $supportBox.Add_TextChanged({ & $refreshFileChecks })
+    $reshadeBrowse.Add_Click({
+        $dialog = New-Object System.Windows.Forms.OpenFileDialog
+        $dialog.Filter = 'ReShade runtime (*.dll)|*.dll'
+        $dialog.Title = 'Choose a local 64-bit ReShade full add-on runtime'
+        if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) { $reshadeBox.Text = $dialog.FileName }
+    })
+    $reshadeBox.Add_TextChanged({ $state.PreviewPlan = $null })
     $gpuBox.Add_SelectedIndexChanged({ [void](& $updateRoute); & $refreshFileChecks })
     $apiBox.Add_SelectedIndexChanged({ [void](& $updateRoute) })
     $nativeBox.Add_SelectedIndexChanged({ [void](& $updateRoute) })
@@ -1462,7 +1643,7 @@ function Show-MainWindow {
         & $setBusy $true 'Downloading and verifying remote dependencies...'
         try {
             $route = & $updateRoute
-            $plan = New-InstallPlan -ExePath $gameBox.Text -Route $route -Gpu ([string]$gpuBox.SelectedItem) -FilesRoot $supportBox.Text -PermitPatched40 $ack40.Checked -FetchRemote $true
+            $plan = New-InstallPlan -ExePath $gameBox.Text -Route $route -Gpu ([string]$gpuBox.SelectedItem) -FilesRoot $supportBox.Text -ReShadeRuntimePath $reshadeBox.Text -PermitPatched40 $ack40.Checked -FetchRemote $true
             $state.PreviewPlan = $plan
             $reviewBox.Text = Format-InstallPlan $plan
             & $setStatus 'All remote dependencies passed verification. Nothing has been installed yet.' 'Success'
@@ -1487,6 +1668,7 @@ function Show-MainWindow {
 
     if ($GameExe) { $gameBox.Text = $GameExe }
     if ($SupportFiles) { $supportBox.Text = $SupportFiles }
+    if ($ReShadeRuntime) { $reshadeBox.Text = $ReShadeRuntime }
     [void](& $updateRoute)
     & $refreshFileChecks
     & $showStep 0
@@ -1525,6 +1707,7 @@ Write-AppLog "$($script:AppName) v$($script:Version) started."
 if ($SelfTest) {
     Test-DecisionMatrix
     Test-BackupRoundTrip
+    Test-NoAdminHelpers
     exit 0
 }
 
@@ -1540,7 +1723,7 @@ if ($Headless) {
     $native = if ($NativeDlss -eq 'Auto') { (Find-NativeDlss $GameExe).Value } else { $NativeDlss }
     $route = Resolve-InstallRoute -Gpu $gpu -Api $api -HasNativeDlss $native
     if (-not $route.CanInstall) { throw $route.Summary }
-    $plan = New-InstallPlan -ExePath $GameExe -Route $route -Gpu $gpu -FilesRoot $SupportFiles -PermitPatched40 ([bool]$AllowPatchedRtx40File) -FetchRemote (-not [bool]$DryRun)
+    $plan = New-InstallPlan -ExePath $GameExe -Route $route -Gpu $gpu -FilesRoot $SupportFiles -ReShadeRuntimePath $ReShadeRuntime -PermitPatched40 ([bool]$AllowPatchedRtx40File) -FetchRemote (-not [bool]$DryRun)
     if ($DryRun) {
         [pscustomobject]@{ Gpu=$gpu; Api=$api; NativeDlss=$native; Route=$route; Plan=(Format-InstallPlan $plan) } | ConvertTo-Json -Depth 6
         exit 0
