@@ -40,7 +40,7 @@ A fresh game download does not automatically provide the correct DLSS 5 model. �
 ## Use
 
 1. Extract this entire folder.
-2. Double-click `DLSS5-Guide-Launcher.cmd`.
+2. Double-click `DLSS5-Guide-Launcher.cmd`. It writes a startup log to `Logs\` beside the launcher before PowerShell is started, so a launch that never shows a window still leaves something to read.
 3. On **Choose game**, select the actual game `.exe`, not only the library/root folder, then click **Analyze game**.
 4. On **Check setup**, confirm the graphics API and whether the game already has native DLSS. The recommended route updates immediately.
 5. On **Support files**, select the folder containing your RenoDX add-on and NVIDIA DLLs. For ReShade, either leave the optional field blank to reuse the target game's existing `dxgi.dll`, or select a local 64-bit full-add-on ReShade runtime DLL.
@@ -54,11 +54,33 @@ For the Feeder route, it also installs the standard `ReShade.fxh` include from a
 
 The launcher performs a write/delete probe in the selected game folder before downloading dependencies. If Windows returns error 5, no game files are changed and the launcher does **not** suggest elevation. Put the game in a user-writable library (for example `C:\Games` only if your account owns that folder), or have the VM owner grant your account Modify permission to that one game folder.
 
-If the official ReShade child installer is blocked by VM policy, select a known-good local ReShade full-add-on runtime in the wizard. If error 5 happens before the launcher window appears, the VM is blocking PowerShell itself; a PowerShell script cannot bypass that policy, so the VM owner must allow the signed/approved launcher or provide an approved deployment channel.
+If the official ReShade child installer is blocked by VM policy, select a known-good local ReShade full-add-on runtime in the wizard. If no window appears at all, read the startup log described under **When nothing appears** below: it distinguishes PowerShell being blocked from the launcher failing after it started, which an error code alone cannot. Where Windows genuinely refuses to start PowerShell, no script can talk it round, and the launcher says so rather than pretending otherwise.
 
 For a Feeder install, the launcher creates or merges `ReShadePreset.ini`, enables **LUMENITE: Kernel 2.0**, and places **DLSS 5 Feed** directly below it. It also adds `DLSS5_MV_PROVIDER=3` to `ReShade.ini` while preserving existing definitions and techniques. After launching, open ReShade and enable Neural Rendering in the DLSS 5 panel.
 
 There is no second interactive ReShade setup window and the user does not have to choose the API twice. If another ReShade proxy (`d3d11.dll` or `d3d12.dll`) is detected, the launcher backs it up and removes it before installing `dxgi.dll`. If the game already has a `dxgi.dll` that is not ReShade, installation stops instead of overwriting an unknown mod loader; that uncommon setup requires manual proxy chain-loading.
+
+## When nothing appears
+
+Double-clicking the launcher writes a startup log before PowerShell is involved at all. Look in `Logs\` beside the launcher; if that folder cannot be written, the launcher falls back to `%TEMP%\DLSS5-Guide-Launcher-Logs` and prints the path it used. Local App Data is never used, because a managed profile can make it unreadable to the account that needs it.
+
+The log walks through five stages, so a silent failure names itself:
+
+1. the wrapper began
+2. `powershell.exe` was found, or was not
+3. Windows allowed the process to start, or refused
+4. the launcher script was found, or was not
+5. the launcher started, and what it exited with
+
+Stage 3 matters most. Finding `powershell.exe` does not prove Windows will let it run, so the wrapper has PowerShell write a small file that only a process which genuinely started could create. Only when that file is missing does the log say **no PowerShell or ReShade code ran** - an exit code on its own cannot tell those apart.
+
+`Collect-Diagnostics.cmd` runs the same checks on their own, without needing PowerShell, and always pauses so the result can be read or copied.
+
+If the launcher did start, its own log records a checkpoint before each step that happens ahead of the window appearing - loading WinForms, reading the graphics card, building the window - so a failure names the stage it died in. Exit codes are grouped: 10-19 the wrapper, 20-29 startup, 30-39 installation, 40-49 rollback, 50-59 self-tests.
+
+The startup log records the folder the launcher was extracted to, how PowerShell was resolved, the Windows version, and the number of arguments passed - never their values, which can contain personal paths.
+
+One honest limit: the launcher reports what it observed, not why Windows refused. `-ExecutionPolicy Bypass` does not override application control such as AppLocker or WDAC, and a policy that blocks the script may leave no trace in the log at all. The log tells you what happened and how far it got; drawing the conclusion is a human job.
 
 ## Safety and rollback
 
@@ -66,9 +88,9 @@ There is no second interactive ReShade setup window and the user does not have t
 - The ReShade installer must carry the exact certificate thumbprint published on reshade.me. Because that certificate is self-signed, Windows may label its otherwise intact signature `UnknownError`/untrusted root; a missing signature, hash mismatch, or different thumbprint is rejected.
 - RTX 50 mode refuses a model DLL without a valid NVIDIA signature.
 - RTX 40 mode clearly labels the model as unofficial and never downloads it.
-- Replaced or removed game files—including the ReShade runtime and configuration—are copied to `%LOCALAPPDATA%\DLSS5-Guide-Launcher\Backups` first.
+- Replaced or removed game files—including the ReShade runtime and configuration—are copied to `Data\Backups` beside the launcher first.
 - **Rollback last install** restores that backup. A file added by the launcher is deleted only if its hash still matches what the launcher installed.
-- Logs are in `%LOCALAPPDATA%\DLSS5-Guide-Launcher\Logs`.
+- Logs are in `Data\Logs` beside the launcher, and the startup log from the wrapper is in `Logs\`. The window footer always shows the folder actually in use.
 
 No malware scanner or source review can promise “100% safe.” Read the script, download dependencies only from the linked projects, scan your user-supplied files, and avoid multiplayer/anti-cheat games unless their rules explicitly permit ReShade and add-ons.
 
@@ -80,7 +102,7 @@ Feeder 0.6 changed its recommended provider to LumeniteFX Kernel. The older ReSh
 
 To prevent a future guide change from silently selecting the wrong provider, version 1.2.0 accepts Feeder 0.6.x, pins the tested official LumeniteFX commit `4615b30a277e5525e25581f5a37728cecac33399`, and pins official `ReShade.fxh` commit `6db142b4b1a05c764222e5b0bd9a644b7ccfe1dc`. A later Feeder series will require a launcher update.
 
-Version 1.3.0-noadmin automates only 64-bit DirectX 11 and DirectX 12 routes. It does not install Vulkan layers or write Vulkan registry keys. Vulkan and DirectX 9 remain advanced/manual routes.
+Version 1.3.1-noadmin automates only 64-bit DirectX 11 and DirectX 12 routes. It does not install Vulkan layers or write Vulkan registry keys. Vulkan and DirectX 9 remain advanced/manual routes.
 
 ## Official project links
 

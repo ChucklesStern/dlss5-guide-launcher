@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.1-noadmin — 2026-09-03
+
+- Added a batch bootstrap that writes a startup log before `powershell.exe` is started, so a launch that never shows a window still leaves readable evidence.
+- Added a sentinel-based probe that distinguishes Windows refusing to start PowerShell from PowerShell starting and then failing; only the former is reported as "no PowerShell or ReShade code ran".
+- Added `Collect-Diagnostics.cmd`, which repeats those checks standalone using only built-in batch commands and always pauses.
+- Moved logs, cache, backups and the install index to a portable `Data` folder beside the launcher, falling back to `%TEMP%`. Local App Data is no longer used, and evaluating the script no longer requires any particular profile directory to exist.
+- Added `-DataRoot` and `-BootstrapLogPath`, and showed the folder actually in use in the window footer.
+- Added startup checkpoints before loading WinForms, reading the graphics card, and building the window, and wrapped startup so a failure records its stage, exception type, message, HRESULT and Windows error code.
+- Added banded exit codes so the wrapper can name the failing subsystem: 10-19 wrapper, 20-29 startup, 30-39 installation, 40-49 rollback, 50-59 self-tests.
+- Made graphics-card detection non-fatal. A blocked WMI/CIM query previously reported "Other / unsupported", turning a policy failure into a hardware verdict and refusing an install the card could run.
+- Added regression tests for the ReShade source priority, portable data-root selection and fallback, the exit-code mapping, and the bootstrap itself, including a test that a startup log appears even when the launcher script is missing.
+- Corrected the documented log and backup paths, and removed the claim that an error 5 before the window proves the VM is blocking PowerShell.
+
 ## 1.3.0-noadmin — 2026-09-03
 
 - Added a no-elevation ReShade flow that reuses an existing game-local runtime or imports a user-selected 64-bit full-add-on runtime before considering the official installer fallback.

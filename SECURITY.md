@@ -25,4 +25,4 @@ No software can promise zero risk. Scan the launcher and every user-supplied bin
 
 ## Reporting a problem
 
-When reporting a bug, include the launcher version, selected route, and the log from `%LOCALAPPDATA%\DLSS5-Guide-Launcher\Logs`. Do not upload copyrighted NVIDIA DLLs.
+When reporting a bug, include the launcher version, the selected route, the startup log from `Logs\` beside the launcher, and the application log from `Data\Logs`. If neither folder was writable the launcher falls back to `%TEMP%\DLSS5-Guide-Launcher-Logs` and prints the path it used. Local App Data is never used for either. The logs record the folder the launcher was extracted to and how far startup got; they do not record argument values, environment dumps, or file contents. Do not upload copyrighted NVIDIA DLLs.
