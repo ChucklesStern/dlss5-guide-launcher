@@ -359,10 +359,6 @@ if not "%EXIT_CODE%"=="0" pause
 endlocal & exit /b %EXIT_CODE%
 
 :describe_code
-if "%EXIT_CODE%"=="2" (
-    echo   Meaning: closed without installing anything.
-    goto :eof
-)
 if "%EXIT_CODE%"=="10" (
     echo   Meaning: powershell.exe was not found. No launcher code ran.
     goto :eof
@@ -389,6 +385,10 @@ if %EXIT_CODE% geq 30 if %EXIT_CODE% leq 39 (
 )
 if %EXIT_CODE% geq 40 if %EXIT_CODE% leq 49 (
     echo   Meaning: the launcher failed during rollback.
+    goto :eof
+)
+if %EXIT_CODE% geq 50 if %EXIT_CODE% leq 59 (
+    echo   Meaning: the launcher self-tests failed.
     goto :eof
 )
 echo   Meaning: unclassified failure reported by PowerShell or the application.

@@ -291,6 +291,22 @@ try {
     Assert-Equal 'starts with an empty %LOCALAPPDATA%' 0 $codeJ
     $logsJ = @(Get-ChildItem -Path (Join-Path $dataRootJ 'Logs') -Filter 'launcher-*.log' -File -ErrorAction SilentlyContinue)
     Write-Result 'still writes its log' ($logsJ.Count -ge 1) 'no log was written'
+    # K. The real script through the real wrapper: the sentinel that Phase 1
+    #    could only report as UNDETERMINED must now resolve, and the wrapper
+    #    must see the application's own startup checkpoints.
+    Write-Host ''
+    Write-Host 'K. real launcher through the real wrapper' -ForegroundColor Cyan
+    $dirK = New-Fixture 'end-to-end'
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'DLSS5-Guide-Launcher.ps1') -Destination (Join-Path $dirK 'DLSS5-Guide-Launcher.ps1')
+    $dataRootK = Join-Path $fixtureRoot 'end-to-end-data'
+    $resultK = Invoke-Bootstrap -LauncherDir $dirK -Arguments @('-SelfTest', '-DataRoot', $dataRootK)
+    Assert-Equal 'self-tests pass through the wrapper' 0 $resultK.ExitCode
+    Assert-Contains 'the wrapper sees that the script began' $resultK.Log 'began executing (startup sentinel present)'
+    Assert-NotContains 'no longer undetermined' $resultK.Log 'UNDETERMINED'
+    Assert-Contains 'the application mirrors checkpoints into the bootstrap log' $resultK.Log '[app]'
+    Assert-Contains 'records the startup checkpoint' $resultK.Log 'Checkpoint: Startup.Begin'
+    Assert-Contains 'records the observed language mode' $resultK.Log 'Language mode:'
+
 }
 finally {
     if (Test-Path -LiteralPath $fixtureRoot) {

@@ -39,6 +39,22 @@ $script:LogRoot = $null
 $script:BackupRoot = $null
 $script:IndexPath = $null
 $script:LogPath = $null
+
+# Stable exit codes, banded so the batch wrapper can name the failing subsystem
+# without knowing anything about the application. 10-19 belong to the wrapper.
+$script:ExitCode = @{
+    Success           = 0
+    StartupStorage    = 20
+    StartupAssemblies = 21
+    StartupUi         = 22
+    StartupUnexpected = 23
+    InstallFailed     = 30
+    RollbackFailed    = 40
+    SelfTestFailed    = 50
+}
+$script:PendingExitCode = 0
+$script:StartupStage = 'Script.Load'
+
 $script:PreparedReShade = $null
 $script:ReshadeThumbprint = '589690208A5E52FB96980C4A6698F50ACD47C49F'
 $script:ReShadeVersion = '6.8.0'
@@ -199,6 +215,97 @@ function Write-AppLog {
     }
 }
 
+function Set-StartupStage {
+    <# Records how far startup got, so a failure can name the stage it died in. #>
+    param([Parameter(Mandatory=$true)][string]$Stage)
+    $script:StartupStage = $Stage
+    Write-AppLog ('Checkpoint: ' + $Stage)
+}
+
+function Write-StartupSentinel {
+    <#
+        Proves to the batch wrapper that this script body actually began, which
+        separates "PowerShell ran but the script never started" from "the script
+        started and then failed". Best effort: it must never break startup.
+    #>
+    $path = $env:DLSS5_STARTUP_SENTINEL
+    if ([string]::IsNullOrWhiteSpace($path)) { return }
+    try { Set-Content -LiteralPath $path -Value 'started' -Encoding ASCII -ErrorAction Stop } catch { }
+}
+
+function Write-StartupEnvironment {
+    <#
+        Observed facts only. These narrow down a blocked start, but none of them
+        proves on its own why Windows refused: -ExecutionPolicy Bypass does not
+        override application control such as AppLocker or WDAC, and a policy
+        that blocks the script may leave no trace here at all. Record what was
+        seen and let a human draw the conclusion.
+    #>
+    try { Write-AppLog ('PowerShell version: {0}' -f $PSVersionTable.PSVersion.ToString()) } catch { }
+    try { Write-AppLog ('Language mode: {0}' -f $ExecutionContext.SessionState.LanguageMode) } catch { }
+    try { Write-AppLog ('64-bit process: {0}' -f [System.Environment]::Is64BitProcess) } catch { }
+    try {
+        foreach ($policy in @(Get-ExecutionPolicy -List)) {
+            Write-AppLog ('Execution policy [{0}]: {1}' -f $policy.Scope, $policy.ExecutionPolicy)
+        }
+    } catch { }
+}
+
+function Get-ExitCodeForStage {
+    <# Maps the stage that failed onto the documented exit-code bands. #>
+    param([string]$Stage)
+    switch -Wildcard ($Stage) {
+        'Startup.Storage' { return $script:ExitCode.StartupStorage }
+        'Ui.Assemblies'   { return $script:ExitCode.StartupAssemblies }
+        'Ui.*'            { return $script:ExitCode.StartupUi }
+        'Install*'        { return $script:ExitCode.InstallFailed }
+        'Rollback*'       { return $script:ExitCode.RollbackFailed }
+        'SelfTest*'       { return $script:ExitCode.SelfTestFailed }
+        default           { return $script:ExitCode.StartupUnexpected }
+    }
+}
+
+function Write-StartupFailure {
+    <#
+        Records everything needed to identify a failure that the user may never
+        have seen on screen, then reports it the best way still available: a
+        message box if WinForms loaded, otherwise stderr, which the batch
+        wrapper captures into the bootstrap log.
+    #>
+    param([Parameter(Mandatory=$true)]$ErrorRecord)
+    $script:PendingExitCode = Get-ExitCodeForStage $script:StartupStage
+    $exception = $ErrorRecord.Exception
+    $type = 'unknown'; $message = ''; $hresult = 0; $native = 0
+    try { $type = $exception.GetType().FullName } catch { }
+    try { $message = $exception.Message } catch { }
+    try { $hresult = [int]$exception.HResult } catch { }
+    try { $native = Get-NativeErrorCode $exception } catch { }
+    $detail = @(
+        'The launcher failed before it could finish starting.',
+        ('  Stage:         {0}' -f $script:StartupStage),
+        ('  Exit code:     {0}' -f $script:PendingExitCode),
+        ('  Exception:     {0}' -f $type),
+        ('  Message:       {0}' -f $message),
+        ('  HRESULT:       0x{0:X8}' -f $hresult),
+        ('  Windows error: {0}' -f $native)
+    ) -join "`r`n"
+    Write-AppLog $detail 'ERROR'
+    try { Write-AppLog ('Script stack: ' + $ErrorRecord.ScriptStackTrace) 'ERROR' } catch { }
+    if ($script:LogPath) { $detail += ("`r`n`r`nLog: " + $script:LogPath) }
+
+    $reported = $false
+    if ($null -ne ([System.Management.Automation.PSTypeName]'System.Windows.Forms.MessageBox').Type) {
+        try {
+            [void][System.Windows.Forms.MessageBox]::Show($detail, ($script:AppName + ' - startup failed'), 'OK', 'Error')
+            $reported = $true
+        }
+        catch { }
+    }
+    if (-not $reported) {
+        try { [Console]::Error.WriteLine($detail) } catch { }
+    }
+}
+
 function Write-DataRootLog {
     <# Records the active data root and every location that was rejected. #>
     Write-AppLog ("Data root: {0} ({1})" -f $script:ActiveDataRoot, $script:ActiveDataRootKind) 'OK'
@@ -237,14 +344,22 @@ function Get-PeArchitecture {
 }
 
 function Get-DetectedGpuClass {
+    <#
+        Detection is never fatal. A machine that blocks WMI/CIM must not be told
+        its GPU is unsupported: that reports a hardware verdict on the strength
+        of a policy failure and refuses an install the card could actually run.
+        A failed query reports 'Auto' and leaves the choice to the user.
+    #>
     try {
         $names = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object { [string]$_.Name })
         $joined = $names -join '; '
-        if ($joined -match '(?i)RTX\s*50\d{2}') { return [pscustomobject]@{ Class='RTX 50 series'; Names=$joined } }
-        if ($joined -match '(?i)RTX\s*40\d{2}') { return [pscustomobject]@{ Class='RTX 40 series (experimental)'; Names=$joined } }
-        return [pscustomobject]@{ Class='Other / unsupported'; Names=$joined }
+        if ($joined -match '(?i)RTX\s*50\d{2}') { return [pscustomobject]@{ Class='RTX 50 series'; Names=$joined; Detected=$true } }
+        if ($joined -match '(?i)RTX\s*40\d{2}') { return [pscustomobject]@{ Class='RTX 40 series (experimental)'; Names=$joined; Detected=$true } }
+        return [pscustomobject]@{ Class='Other / unsupported'; Names=$joined; Detected=$true }
     }
-    catch { return [pscustomobject]@{ Class='Other / unsupported'; Names='Detection failed: ' + $_.Exception.Message } }
+    catch {
+        return [pscustomobject]@{ Class='Auto'; Names=('Detection unavailable: ' + $_.Exception.Message); Detected=$false }
+    }
 }
 
 function Find-NativeDlss {
@@ -1238,6 +1353,66 @@ function Test-PortableStorage {
     }
 }
 
+function Test-StartupContract {
+    <#
+        The exit-code table and the startup instrumentation are a contract with
+        the batch wrapper, which reports the failing subsystem purely from the
+        code. Assert the mapping rather than trusting it to stay in step.
+    #>
+    $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('DLSS5-Launcher-Startup-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+    try {
+        $cases = @(
+            @('Startup.Storage', $script:ExitCode.StartupStorage),
+            @('Ui.Assemblies',   $script:ExitCode.StartupAssemblies),
+            @('Ui.Construction', $script:ExitCode.StartupUi),
+            @('Ui.Show',         $script:ExitCode.StartupUi),
+            @('Install.Plan',    $script:ExitCode.InstallFailed),
+            @('Install.Apply',   $script:ExitCode.InstallFailed),
+            @('Rollback',        $script:ExitCode.RollbackFailed),
+            @('SelfTest',        $script:ExitCode.SelfTestFailed),
+            @('Script.Load',     $script:ExitCode.StartupUnexpected)
+        )
+        foreach ($case in $cases) {
+            $actual = Get-ExitCodeForStage $case[0]
+            if ($actual -ne $case[1]) { throw "Stage '$($case[0])' mapped to exit code $actual, expected $($case[1])." }
+        }
+
+        $values = @($script:ExitCode.Values)
+        if (@($values | Sort-Object -Unique).Count -ne $values.Count) { throw 'The documented exit codes are not distinct.' }
+        foreach ($value in $values) {
+            if ($value -ge 10 -and $value -le 19) { throw "Exit code $value collides with the bootstrap wrapper's reserved 10-19 band." }
+        }
+
+        # The sentinel is what lets the wrapper distinguish "never began" from
+        # "began and failed", and it must be best effort in both directions.
+        $previous = $env:DLSS5_STARTUP_SENTINEL
+        try {
+            $sentinel = Join-Path $testRoot 'sentinel.tmp'
+            $env:DLSS5_STARTUP_SENTINEL = $sentinel
+            Write-StartupSentinel
+            if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf)) { throw 'The startup sentinel was not written.' }
+
+            $env:DLSS5_STARTUP_SENTINEL = Join-Path $testRoot 'missing-parent\nested\sentinel.tmp'
+            Write-StartupSentinel
+
+            $env:DLSS5_STARTUP_SENTINEL = ''
+            Write-StartupSentinel
+        }
+        finally { $env:DLSS5_STARTUP_SENTINEL = $previous }
+
+        # A blocked GPU query must report a manual choice, never a hardware verdict.
+        $gpu = Get-DetectedGpuClass
+        if (-not $gpu.PSObject.Properties['Detected']) { throw 'GPU detection did not report whether it succeeded.' }
+        if ([string]::IsNullOrWhiteSpace([string]$gpu.Class)) { throw 'GPU detection returned no class at all.' }
+
+        Write-AppLog 'Startup contract, sentinel and exit-code mapping tests passed.' 'OK'
+    }
+    finally {
+        if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Test-NoAdminHelpers {
     $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('DLSS5-Launcher-NoAdmin-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
@@ -1269,11 +1444,25 @@ function Test-NoAdminHelpers {
 }
 
 function Show-MainWindow {
+    Set-StartupStage 'Ui.Assemblies'
+    Write-AppLog 'WinForms.Initialization.Begin'
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
+    Write-AppLog 'WinForms.Initialization.Complete' 'OK'
 
+    Set-StartupStage 'Ui.GpuDetection'
+    Write-AppLog 'GpuDetection.Begin'
     $detectedGpu = Get-DetectedGpuClass
+    if ($detectedGpu.Detected) {
+        Write-AppLog ('GpuDetection.Complete: ' + $detectedGpu.Class) 'OK'
+    }
+    else {
+        Write-AppLog ('GpuDetection.Complete: unavailable, continuing with a manual choice. ' + $detectedGpu.Names) 'WARN'
+    }
+
+    Set-StartupStage 'Ui.Construction'
+    Write-AppLog 'Ui.Construction.Begin'
     $colors = @{
         Window      = [System.Drawing.Color]::FromArgb(15,23,42)
         Header      = [System.Drawing.Color]::FromArgb(11,18,32)
@@ -1512,7 +1701,7 @@ function Show-MainWindow {
     $gpuBox.Size = New-Object System.Drawing.Size(252,28)
     [void]$gpuBox.Items.AddRange([object[]]@('RTX 50 series','RTX 40 series (experimental)','Other / unsupported'))
     & $styleInput $gpuBox
-    $gpuBox.SelectedItem = $detectedGpu.Class
+    if ($detectedGpu.Detected) { $gpuBox.SelectedItem = $detectedGpu.Class }
     $pageSetup.Controls.Add($gpuBox)
     [void](& $newLabel $pageSetup 'GRAPHICS API' 274 91 220 20 8.5 $true $colors.Muted)
     $apiBox = New-Object System.Windows.Forms.ComboBox
@@ -1532,7 +1721,8 @@ function Show-MainWindow {
     & $styleInput $nativeBox
     $nativeBox.SelectedItem = 'Unsure'
     $pageSetup.Controls.Add($nativeBox)
-    $gpuInfo = & $newLabel $pageSetup ('Detected: ' + $detectedGpu.Names) 0 154 802 25 8.5 $false $colors.Muted
+    $gpuText = if ($detectedGpu.Detected) { 'Detected: ' + $detectedGpu.Names } else { 'Could not read the graphics card on this machine, so please choose it above. ' + $detectedGpu.Names }
+    $gpuInfo = & $newLabel $pageSetup $gpuText 0 154 802 25 8.5 $false $colors.Muted
     $gpuInfo.AutoEllipsis = $true
 
     $routeCard = New-Object System.Windows.Forms.Panel
@@ -1875,7 +2065,10 @@ function Show-MainWindow {
     & $refreshFileChecks
     & $showStep 0
     $form.ResumeLayout($false)
+    Write-AppLog 'Ui.Construction.Complete' 'OK'
+    Set-StartupStage 'Ui.Show'
     $form.Add_Shown({
+        Write-AppLog 'Ui.Shown' 'OK'
         if ($GameExe -and (Test-Path -LiteralPath $GameExe -PathType Leaf)) {
             try { & $analyzeGame } catch { $analysisHeadline.Text = 'Game selected - review needed'; $analysisDetail.Text = $_.Exception.Message }
         }
@@ -1903,41 +2096,83 @@ function Show-MainWindow {
     [void]$form.ShowDialog()
 }
 
-if (-not (Initialize-AppLogging)) {
-    Write-Warning 'The launcher could not open its own log file. Startup continues; the bootstrap log records what happens next.'
-}
-Initialize-AppStorage
-Write-AppLog "$($script:AppName) v$($script:Version) started."
-Write-DataRootLog
-
-if ($SelfTest) {
-    Test-DecisionMatrix
-    Test-BackupRoundTrip
-    Test-PortableStorage
-    Test-NoAdminHelpers
-    exit 0
-}
-
-if ($Headless) {
+function Invoke-HeadlessMode {
     if (-not $GameExe) { throw '-GameExe is required in headless mode.' }
     if ($Rollback) {
+        Set-StartupStage 'Rollback'
         $rolledBack = Invoke-Rollback $GameExe
         Write-Host "Rollback complete. Manifest: $rolledBack"
-        exit 0
+        return
     }
-    $gpu = if ($GpuClass -eq 'Auto') { (Get-DetectedGpuClass).Class } else { $GpuClass }
+    $gpu = $GpuClass
+    if ($gpu -eq 'Auto') {
+        $detected = Get-DetectedGpuClass
+        if (-not $detected.Detected) {
+            throw "The graphics card could not be read on this machine ($($detected.Names)). Pass -GpuClass explicitly; the launcher will not guess a hardware verdict from a failed query."
+        }
+        $gpu = $detected.Class
+    }
     $api = if ($GraphicsApi -eq 'Auto') { (Get-DetectedApi $GameExe).Value } else { $GraphicsApi }
     $native = if ($NativeDlss -eq 'Auto') { (Find-NativeDlss $GameExe).Value } else { $NativeDlss }
     $route = Resolve-InstallRoute -Gpu $gpu -Api $api -HasNativeDlss $native
     if (-not $route.CanInstall) { throw $route.Summary }
+    Set-StartupStage 'Install.Plan'
     $plan = New-InstallPlan -ExePath $GameExe -Route $route -Gpu $gpu -FilesRoot $SupportFiles -ReShadeRuntimePath $ReShadeRuntime -PermitPatched40 ([bool]$AllowPatchedRtx40File) -FetchRemote (-not [bool]$DryRun)
     if ($DryRun) {
         [pscustomobject]@{ Gpu=$gpu; Api=$api; NativeDlss=$native; Route=$route; Plan=(Format-InstallPlan $plan) } | ConvertTo-Json -Depth 6
-        exit 0
+        return
     }
+    Set-StartupStage 'Install.Apply'
     $manifest = Invoke-InstallPlan $plan
     Write-Host "Installation complete. Manifest: $manifest"
-    exit 0
 }
 
-Show-MainWindow
+function Invoke-Main {
+    <#
+        The whole of startup, guarded. Ordering matters and is deliberate:
+        prove the script body began, open a log, only then touch storage, so
+        that every later failure has somewhere to be recorded.
+
+        This is called as a bare statement rather than for its return value, so
+        that headless output such as the -DryRun JSON still reaches stdout
+        unchanged. The exit code travels in script state instead.
+    #>
+    try {
+        Write-StartupSentinel
+        $loggingReady = Initialize-AppLogging
+        Set-StartupStage 'Startup.Begin'
+        Write-AppLog "$($script:AppName) v$($script:Version) started."
+        if (-not $loggingReady) {
+            Write-Warning 'The launcher could not open its own log file. Startup continues, and the bootstrap log records what happens next.'
+        }
+        Write-StartupEnvironment
+
+        Set-StartupStage 'Startup.Storage'
+        Initialize-AppStorage
+        Write-DataRootLog
+
+        if ($SelfTest) {
+            Set-StartupStage 'SelfTest'
+            Test-DecisionMatrix
+            Test-BackupRoundTrip
+            Test-PortableStorage
+            Test-StartupContract
+            Test-NoAdminHelpers
+            return
+        }
+
+        if ($Headless) {
+            Set-StartupStage 'Headless'
+            Invoke-HeadlessMode
+            return
+        }
+
+        Show-MainWindow
+    }
+    catch {
+        Write-StartupFailure $_
+    }
+}
+
+Invoke-Main
+exit $script:PendingExitCode
