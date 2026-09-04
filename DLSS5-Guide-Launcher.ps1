@@ -109,7 +109,9 @@ function Get-DataRootCandidate {
     if (-not [string]::IsNullOrWhiteSpace($TempRoot)) {
         $candidates += [pscustomobject]@{ Path = (Join-Path $TempRoot 'DLSS5-Guide-Launcher'); Kind = 'temp' }
     }
-    return @($candidates)
+    # The comma keeps an empty result an empty array: PowerShell unrolls a bare
+    # @() on return into $null, which the caller cannot tell from a failure.
+    return ,@($candidates)
 }
 
 function Resolve-WritableRoot {
@@ -118,9 +120,9 @@ function Resolve-WritableRoot {
         with every attempt and why it was rejected, so the log can explain the
         choice rather than merely announce it.
     #>
-    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$Candidates)
+    param([AllowNull()][AllowEmptyCollection()][object[]]$Candidates = @())
     $attempts = @()
-    foreach ($candidate in $Candidates) {
+    foreach ($candidate in @($Candidates)) {
         $reason = Test-DirectoryUsable $candidate.Path
         if (-not $reason) {
             $attempts += [pscustomobject]@{ Path = $candidate.Path; Kind = $candidate.Kind; Result = 'usable' }
