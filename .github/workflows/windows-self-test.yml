@@ -8,7 +8,17 @@ permissions:
   contents: read
 
 jobs:
+  bootstrap:
+    name: Batch bootstrap
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run bootstrap tests
+        shell: powershell
+        run: .\tests\Test-Bootstrap.ps1
+
   powershell-51:
+    name: Windows PowerShell 5.1
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v7
