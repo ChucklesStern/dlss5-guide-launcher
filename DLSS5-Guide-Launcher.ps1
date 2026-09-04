@@ -1406,6 +1406,30 @@ function Test-StartupContract {
         if (-not $gpu.PSObject.Properties['Detected']) { throw 'GPU detection did not report whether it succeeded.' }
         if ([string]::IsNullOrWhiteSpace([string]$gpu.Class)) { throw 'GPU detection returned no class at all.' }
 
+        # A failure the user never saw on screen still has to be legible in the
+        # log afterwards, so drive the reporter directly rather than trusting it.
+        $savedCode = $script:PendingExitCode
+        $savedStage = $script:StartupStage
+        try {
+            $script:StartupStage = 'Ui.Construction'
+            $probe = New-Object System.IO.FileNotFoundException('a synthetic startup failure for the self-test')
+            $record = New-Object System.Management.Automation.ErrorRecord($probe, 'SelfTestProbe', [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+            Write-StartupFailure $record
+            if ($script:PendingExitCode -ne $script:ExitCode.StartupUi) {
+                throw "A UI-stage failure mapped to exit code $($script:PendingExitCode), expected $($script:ExitCode.StartupUi)."
+            }
+            if ($script:LogPath) {
+                $logged = Get-Content -LiteralPath $script:LogPath -Raw
+                foreach ($required in @('Stage:         Ui.Construction', 'System.IO.FileNotFoundException', 'a synthetic startup failure', 'HRESULT:', 'Windows error:')) {
+                    if (-not $logged.Contains($required)) { throw "The startup failure log is missing: $required" }
+                }
+            }
+        }
+        finally {
+            $script:PendingExitCode = $savedCode
+            $script:StartupStage = $savedStage
+        }
+
         Write-AppLog 'Startup contract, sentinel and exit-code mapping tests passed.' 'OK'
     }
     finally {
