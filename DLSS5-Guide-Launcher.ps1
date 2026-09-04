@@ -1443,6 +1443,143 @@ function Test-NoAdminHelpers {
     }
 }
 
+function New-ReShadeTestRuntime {
+    <#
+        Builds a real DLL whose Win32 version resource identifies it as ReShade
+        and whose PE header says 64-bit, so the ReShade source rules are proven
+        against a genuine file rather than a stub that flatters them.
+
+        If the .NET Framework compiler is unavailable this throws rather than
+        skipping: a silently skipped regression test is worse than none.
+    #>
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $typeName = 'DlssFiveReShadeFixture' + [guid]::NewGuid().ToString('N')
+    $source = @"
+using System.Reflection;
+[assembly: AssemblyProduct("ReShade")]
+[assembly: AssemblyTitle("ReShade")]
+[assembly: AssemblyFileVersion("6.8.0.0")]
+public class $typeName { }
+"@
+    try {
+        $parameters = New-Object System.CodeDom.Compiler.CompilerParameters
+        $parameters.OutputAssembly = $Path
+        $parameters.GenerateExecutable = $false
+        $parameters.GenerateInMemory = $false
+        $parameters.CompilerOptions = '/platform:x64'
+        Add-Type -TypeDefinition $source -CompilerParameters $parameters
+    }
+    catch {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            throw "The ReShade regression tests could not build their fixture DLL, so they cannot run: $($_.Exception.Message)"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'The ReShade regression tests could not build their fixture DLL, so they cannot run.'
+    }
+    return $Path
+}
+
+function Set-PeMachineForTest {
+    <#
+        Rewrites the PE machine field of a copy, so the architecture rule can be
+        tested without a second compiler invocation that may not be loadable in
+        this process.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][uint16]$Machine
+    )
+    $stream = [System.IO.File]::Open($Path, 'Open', 'ReadWrite', 'None')
+    try {
+        $reader = New-Object System.IO.BinaryReader($stream)
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadInt32()
+        $stream.Position = $peOffset + 4
+        $writer = New-Object System.IO.BinaryWriter($stream)
+        $writer.Write($Machine)
+        $writer.Flush()
+    }
+    finally { $stream.Dispose() }
+}
+
+function Test-ReShadeSourceSelection {
+    <#
+        The no-admin ReShade rules are the reason this build exists, and the
+        surrounding work must not quietly change them. Assert the whole source
+        priority rather than relying on reading the code.
+    #>
+    $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('DLSS5-Launcher-ReShade-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+    try {
+        $runtime = New-ReShadeTestRuntime -Path (Join-Path $testRoot 'ReShade64.dll')
+        if ((Get-PeArchitecture $runtime) -ne '64-bit') { throw 'The fixture runtime is not 64-bit; the tests below would prove nothing.' }
+        if (-not (Test-IsReShadeRuntime $runtime)) { throw 'The fixture runtime is not recognised as ReShade; the tests below would prove nothing.' }
+
+        # 1. A recognised runtime already beside the game is reused as-is, and
+        #    no installer is prepared.
+        $gameExisting = Join-Path $testRoot 'game-existing'
+        New-Item -ItemType Directory -Path $gameExisting -Force | Out-Null
+        Copy-Item -LiteralPath $runtime -Destination (Join-Path $gameExisting 'dxgi.dll')
+        $existing = Resolve-ReShadeSource -GameDirectory $gameExisting -FetchRemote $false
+        if ($existing.SourceMode -ne 'Existing game runtime') { throw "Expected the existing game runtime, got '$($existing.SourceMode)'." }
+        if (-not $existing.AlreadyInstalled) { throw 'A reused runtime was not reported as already installed.' }
+        if ($existing.Installer) { throw 'Reusing an existing runtime must not prepare the ReShade installer.' }
+
+        # 2. Otherwise a runtime the user selected is imported.
+        $gameSelected = Join-Path $testRoot 'game-selected'
+        New-Item -ItemType Directory -Path $gameSelected -Force | Out-Null
+        $selected = Resolve-ReShadeSource -GameDirectory $gameSelected -RuntimePath $runtime -FetchRemote $false
+        if ($selected.SourceMode -ne 'User-selected local runtime') { throw "Expected the user-selected runtime, got '$($selected.SourceMode)'." }
+        if ($selected.AlreadyInstalled) { throw 'A newly imported runtime was reported as already installed.' }
+        if ($selected.Installer) { throw 'Importing a local runtime must not prepare the ReShade installer.' }
+        if ($selected.Runtime -ne ([System.IO.Path]::GetFullPath($runtime))) { throw 'The selected runtime path was not preserved.' }
+
+        # 3. Only with neither does the official fallback appear, and nothing is
+        #    downloaded or executed to preview it.
+        $gameFallback = Join-Path $testRoot 'game-fallback'
+        New-Item -ItemType Directory -Path $gameFallback -Force | Out-Null
+        $fallback = Resolve-ReShadeSource -GameDirectory $gameFallback -FetchRemote $false
+        if ($fallback.SourceMode -ne 'Verified official fallback') { throw "Expected the official fallback, got '$($fallback.SourceMode)'." }
+        if ($fallback.Runtime -or $fallback.Installer) { throw 'Previewing the fallback must not stage a runtime or an installer.' }
+
+        # 4. An unknown proxy is refused, and left exactly as it was found.
+        $gameUnknown = Join-Path $testRoot 'game-unknown'
+        New-Item -ItemType Directory -Path $gameUnknown -Force | Out-Null
+        $unknownDxgi = Join-Path $gameUnknown 'dxgi.dll'
+        Set-Content -LiteralPath $unknownDxgi -Value 'some other mod loader' -Encoding ASCII
+        $unknownHash = Get-Sha256 $unknownDxgi
+        $refused = $false
+        try { Resolve-ReShadeSource -GameDirectory $gameUnknown -RuntimePath $runtime -FetchRemote $false | Out-Null }
+        catch { $refused = $_.Exception.Message -match 'non-ReShade dxgi\.dll' }
+        if (-not $refused) { throw 'An unknown dxgi.dll was not refused.' }
+        if ((Get-Sha256 $unknownDxgi) -ne $unknownHash) { throw 'An unknown dxgi.dll was modified despite the refusal.' }
+
+        # 5. A runtime that is not 64-bit is refused, whatever it calls itself.
+        $x86Runtime = Join-Path $testRoot 'ReShade32.dll'
+        Copy-Item -LiteralPath $runtime -Destination $x86Runtime
+        Set-PeMachineForTest -Path $x86Runtime -Machine ([uint16]0x014C)
+        if ((Get-PeArchitecture $x86Runtime) -ne '32-bit') { throw 'The 32-bit fixture was not produced correctly.' }
+        $rejectedArchitecture = $false
+        try { Get-LocalReShadeFiles -Path $x86Runtime -SourceMode 'test' | Out-Null }
+        catch { $rejectedArchitecture = $_.Exception.Message -match '32-bit' }
+        if (-not $rejectedArchitecture) { throw 'A 32-bit ReShade runtime was not refused.' }
+
+        # 6. A DLL that does not identify itself as ReShade is refused too.
+        $notReShade = Join-Path $testRoot 'random.dll'
+        Copy-Item -LiteralPath (Join-Path $env:WINDIR 'System32\kernel32.dll') -Destination $notReShade
+        $rejectedIdentity = $false
+        try { Get-LocalReShadeFiles -Path $notReShade -SourceMode 'test' | Out-Null }
+        catch { $rejectedIdentity = $_.Exception.Message -match 'does not identify itself as ReShade' }
+        if (-not $rejectedIdentity) { throw 'A DLL that is not ReShade was accepted as a runtime.' }
+
+        Write-AppLog 'ReShade source-priority regression tests passed.' 'OK'
+    }
+    finally {
+        if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Show-MainWindow {
     Set-StartupStage 'Ui.Assemblies'
     Write-AppLog 'WinForms.Initialization.Begin'
@@ -2158,6 +2295,7 @@ function Invoke-Main {
             Test-PortableStorage
             Test-StartupContract
             Test-NoAdminHelpers
+            Test-ReShadeSourceSelection
             return
         }
 
