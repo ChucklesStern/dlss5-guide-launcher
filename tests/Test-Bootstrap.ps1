@@ -246,6 +246,51 @@ try {
         Assert-Contains 'reports launcher folder write access' $reportText 'Launcher folder is writable'
         Assert-Contains 'notes the missing application script' $reportText 'Application script is MISSING'
     }
+    # I. End-to-end proof that -DataRoot reaches the resolver. The script scope
+    #    holds both the parameter and the launcher's own state, so a state
+    #    variable named after the parameter would shadow it silently and this is
+    #    the only test that would notice.
+    Write-Host ''
+    Write-Host 'I. -DataRoot is honoured end to end' -ForegroundColor Cyan
+    $launcher = Join-Path $repoRoot 'DLSS5-Guide-Launcher.ps1'
+    $dataRootI = Join-Path $fixtureRoot 'explicit-data-root'
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $null = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $launcher -SelfTest -DataRoot $dataRootI 2>&1
+        $codeI = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $previousPreference }
+    Assert-Equal 'self-tests pass under an explicit data root' 0 $codeI
+    $logsI = @(Get-ChildItem -Path (Join-Path $dataRootI 'Logs') -Filter 'launcher-*.log' -File -ErrorAction SilentlyContinue)
+    Write-Result 'writes its log under the explicit data root' ($logsI.Count -ge 1) "no log under $dataRootI"
+    Write-Result 'creates Cache under the explicit data root' (Test-Path -LiteralPath (Join-Path $dataRootI 'Cache') -PathType Container) 'Cache missing'
+    Write-Result 'creates Backups under the explicit data root' (Test-Path -LiteralPath (Join-Path $dataRootI 'Backups') -PathType Container) 'Backups missing'
+    if ($logsI.Count -ge 1) {
+        $logTextI = Get-Content -LiteralPath $logsI[0].FullName -Raw
+        Assert-Contains 'records the active data root' $logTextI 'Data root:'
+        Assert-Contains 'records that the root was explicit' $logTextI '(explicit)'
+    }
+
+    # J. A hostile %LOCALAPPDATA% must be irrelevant now, not merely survivable.
+    Write-Host ''
+    Write-Host 'J. startup does not depend on %LOCALAPPDATA%' -ForegroundColor Cyan
+    $dataRootJ = Join-Path $fixtureRoot 'no-localappdata'
+    $previousLocal = $env:LOCALAPPDATA
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $env:LOCALAPPDATA = ''
+        $null = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $launcher -SelfTest -DataRoot $dataRootJ 2>&1
+        $codeJ = $LASTEXITCODE
+    }
+    finally {
+        $env:LOCALAPPDATA = $previousLocal
+        $ErrorActionPreference = $previousPreference
+    }
+    Assert-Equal 'starts with an empty %LOCALAPPDATA%' 0 $codeJ
+    $logsJ = @(Get-ChildItem -Path (Join-Path $dataRootJ 'Logs') -Filter 'launcher-*.log' -File -ErrorAction SilentlyContinue)
+    Write-Result 'still writes its log' ($logsJ.Count -ge 1) 'no log was written'
 }
 finally {
     if (Test-Path -LiteralPath $fixtureRoot) {

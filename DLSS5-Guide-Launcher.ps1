@@ -16,19 +16,28 @@ param(
     [string]$NativeDlss = 'Auto',
     [string]$SupportFiles,
     [string]$ReShadeRuntime,
-    [switch]$AllowPatchedRtx40File
+    [switch]$AllowPatchedRtx40File,
+    [string]$DataRoot,
+    [string]$BootstrapLogPath = $env:DLSS5_BOOTSTRAP_LOG
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:AppName = 'DLSS 5 Guide Launcher'
-$script:Version = '1.3.0-noadmin'
-$script:AppDataRoot = Join-Path $env:LOCALAPPDATA 'DLSS5-Guide-Launcher'
-$script:CacheRoot = Join-Path $script:AppDataRoot 'Cache'
-$script:LogRoot = Join-Path $script:AppDataRoot 'Logs'
-$script:BackupRoot = Join-Path $script:AppDataRoot 'Backups'
-$script:IndexPath = Join-Path $script:AppDataRoot 'install-index.json'
+$script:Version = '1.3.1-noadmin'
+
+# Storage locations are resolved at startup, never at script scope. Merely
+# evaluating this file must not require any particular profile directory to
+# exist, be accessible, or be writable: a null or redirected %LOCALAPPDATA%
+# used to throw here, before a single line could be logged anywhere.
+$script:ActiveDataRoot = $null
+$script:ActiveDataRootKind = 'unresolved'
+$script:ActiveDataRootAttempts = @()
+$script:CacheRoot = $null
+$script:LogRoot = $null
+$script:BackupRoot = $null
+$script:IndexPath = $null
 $script:LogPath = $null
 $script:PreparedReShade = $null
 $script:ReshadeThumbprint = '589690208A5E52FB96980C4A6698F50ACD47C49F'
@@ -43,31 +52,159 @@ $script:LumeniteRepo = 'umar-afzaal/LumeniteFX'
 $script:LumeniteCommit = '4615b30a277e5525e25581f5a37728cecac33399'
 $script:LumeniteArchiveSha256 = 'fb60f9b1a1212d0a718d7ccad8f81af791560c26cc276e3952228a74b5269fe1'
 
-function Initialize-AppStorage {
-    foreach ($path in @($script:AppDataRoot, $script:CacheRoot, $script:LogRoot, $script:BackupRoot)) {
-        try {
-            if (-not (Test-Path -LiteralPath $path)) {
-                New-Item -ItemType Directory -Path $path -Force | Out-Null
-            }
+function Test-DirectoryUsable {
+    <#
+        Reports whether a directory can be created and written to by the current
+        user. Returns $null when it can, otherwise a human-readable reason.
+
+        This never throws, because it runs before any log exists. Its callers
+        need a reason to record, not an exception to propagate.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return 'no path was supplied' }
+    try {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) { return 'a file already exists at that path' }
+        if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+            New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
         }
-        catch {
-            $code = Get-NativeErrorCode $_.Exception
-            if ($code -eq 5 -or $_.Exception -is [System.UnauthorizedAccessException]) {
-                throw "Windows denied access to the launcher's current-user storage (error 5): $path`r`n`r`nThis launcher does not require or request administrator access. Ask the VM owner to allow your account to write under %LOCALAPPDATA%, or use a Windows account with a writable profile."
-            }
-            throw
+        $probe = Join-Path $Path ('.dlss5-root-check-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        $stream = [System.IO.File]::Open($probe, 'CreateNew', 'Write', 'None')
+        try { $stream.WriteByte(0) } finally { $stream.Dispose() }
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    catch {
+        $code = 0
+        try { $code = Get-NativeErrorCode $_.Exception } catch { $code = 0 }
+        if ($code -eq 5 -or $_.Exception -is [System.UnauthorizedAccessException]) {
+            return ('Windows denied access (error 5): ' + $_.Exception.Message)
+        }
+        return $_.Exception.Message
+    }
+}
+
+function Get-DataRootCandidate {
+    <#
+        The ordered list of places the launcher will keep its data. A portable
+        folder beside the launcher comes first so that everything the user may
+        need to read stays where they extracted it. %TEMP% is the fallback.
+        Local App Data is deliberately absent: a managed profile can make it
+        unreadable to the very user who needs the logs.
+
+        Taking the roots as parameters keeps this a seam the tests can drive
+        with synthetic paths instead of depending on runner ACLs.
+    #>
+    param(
+        [AllowEmptyString()][string]$Explicit,
+        [AllowEmptyString()][string]$ScriptRoot,
+        [AllowEmptyString()][string]$TempRoot
+    )
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($Explicit)) {
+        $candidates += [pscustomobject]@{ Path = $Explicit; Kind = 'explicit' }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ScriptRoot)) {
+        $candidates += [pscustomobject]@{ Path = (Join-Path $ScriptRoot 'Data'); Kind = 'portable' }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TempRoot)) {
+        $candidates += [pscustomobject]@{ Path = (Join-Path $TempRoot 'DLSS5-Guide-Launcher'); Kind = 'temp' }
+    }
+    return @($candidates)
+}
+
+function Resolve-WritableRoot {
+    <#
+        Walks the candidates in order and returns the first usable one, together
+        with every attempt and why it was rejected, so the log can explain the
+        choice rather than merely announce it.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$Candidates)
+    $attempts = @()
+    foreach ($candidate in $Candidates) {
+        $reason = Test-DirectoryUsable $candidate.Path
+        if (-not $reason) {
+            $attempts += [pscustomobject]@{ Path = $candidate.Path; Kind = $candidate.Kind; Result = 'usable' }
+            return [pscustomobject]@{ Path = $candidate.Path; Kind = $candidate.Kind; Attempts = @($attempts); Resolved = $true }
+        }
+        $attempts += [pscustomobject]@{ Path = $candidate.Path; Kind = $candidate.Kind; Result = $reason }
+    }
+    return [pscustomobject]@{ Path = $null; Kind = 'none'; Attempts = @($attempts); Resolved = $false }
+}
+
+function Initialize-AppLogging {
+    <#
+        The earliest PowerShell-side side effect: find somewhere to write and
+        open the application log. Deliberately lighter than Initialize-AppStorage
+        so that storage failures can be reported through a log that already
+        exists. Returns $true when the application log is open.
+
+        The roots are parameters rather than direct reads of script state: the
+        -DataRoot parameter lives in the script scope, so state named after it
+        would shadow it silently.
+    #>
+    param(
+        [AllowEmptyString()][string]$ExplicitRoot = $DataRoot,
+        [AllowEmptyString()][string]$ScriptRoot = $PSScriptRoot,
+        [AllowEmptyString()][string]$TempRoot = ([System.IO.Path]::GetTempPath())
+    )
+    $resolution = Resolve-WritableRoot (Get-DataRootCandidate -Explicit $ExplicitRoot -ScriptRoot $ScriptRoot -TempRoot $TempRoot)
+    $script:ActiveDataRootAttempts = $resolution.Attempts
+    if (-not $resolution.Resolved) {
+        $script:ActiveDataRootKind = 'none'
+        return $false
+    }
+    $script:ActiveDataRoot = $resolution.Path
+    $script:ActiveDataRootKind = $resolution.Kind
+    $logRoot = Join-Path $resolution.Path 'Logs'
+    $reason = Test-DirectoryUsable $logRoot
+    if ($reason) { return $false }
+    $script:LogRoot = $logRoot
+    $script:LogPath = Join-Path $logRoot ('launcher-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    return $true
+}
+
+function Initialize-AppStorage {
+    <# Creates the rest of the portable data root. Requires Initialize-AppLogging. #>
+    if (-not $script:ActiveDataRoot) {
+        $tried = ($script:ActiveDataRootAttempts | ForEach-Object { '  {0}  ({1})' -f $_.Path, $_.Result }) -join "`r`n"
+        throw "The launcher could not find a writable folder for its own data.`r`n`r`nTried:`r`n$tried`r`n`r`nThis launcher does not require or request administrator access. Extract it somewhere your Windows account can write, such as your Downloads folder."
+    }
+    $script:CacheRoot = Join-Path $script:ActiveDataRoot 'Cache'
+    $script:BackupRoot = Join-Path $script:ActiveDataRoot 'Backups'
+    $script:IndexPath = Join-Path $script:ActiveDataRoot 'install-index.json'
+    foreach ($path in @($script:CacheRoot, $script:BackupRoot)) {
+        $reason = Test-DirectoryUsable $path
+        if ($reason) {
+            throw "The launcher could not create part of its data folder: $path`r`n`r`nReason: $reason`r`n`r`nThis launcher does not require or request administrator access."
         }
     }
-    $script:LogPath = Join-Path $script:LogRoot ('launcher-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 }
 
 function Write-AppLog {
     param([string]$Message, [ValidateSet('INFO','OK','WARN','ERROR')] [string]$Level = 'INFO')
     $line = '[{0}] [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
-    if ($script:LogPath) { Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8 }
+    # Logging is best effort by design. A failure to record what happened must
+    # never replace or mask the thing that actually happened.
+    if ($script:LogPath) {
+        try { Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8 } catch { }
+    }
+    if ($BootstrapLogPath) {
+        try { Add-Content -LiteralPath $BootstrapLogPath -Value ('  [app] ' + $line) -Encoding UTF8 } catch { }
+    }
     if ($Headless -or $SelfTest) {
         $color = switch ($Level) { 'OK' {'Green'} 'WARN' {'Yellow'} 'ERROR' {'Red'} default {'Gray'} }
         Write-Host $line -ForegroundColor $color
+    }
+}
+
+function Write-DataRootLog {
+    <# Records the active data root and every location that was rejected. #>
+    Write-AppLog ("Data root: {0} ({1})" -f $script:ActiveDataRoot, $script:ActiveDataRootKind) 'OK'
+    Write-AppLog ("Log file:  {0}" -f $script:LogPath)
+    foreach ($attempt in $script:ActiveDataRootAttempts) {
+        if ($attempt.Result -ne 'usable') {
+            Write-AppLog ("Rejected data root {0} ({1}): {2}" -f $attempt.Path, $attempt.Kind, $attempt.Result) 'WARN'
+        }
     }
 }
 
@@ -1042,6 +1179,63 @@ function Test-BackupRoundTrip {
     }
 }
 
+function Test-PortableStorage {
+    <#
+        Storage-root selection is driven through the Get-DataRootCandidate /
+        Resolve-WritableRoot seam with synthetic paths, so the fallback cases are
+        deterministic on any machine. Reproducing an ACL denial belongs in a
+        separate Windows integration test, not here.
+    #>
+    $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('DLSS5-Launcher-Storage-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+    try {
+        # The portable folder beside the launcher wins when it is usable.
+        $scriptRoot = Join-Path $testRoot 'launcher'
+        $tempRoot = Join-Path $testRoot 'temp'
+        New-Item -ItemType Directory -Path $scriptRoot,$tempRoot -Force | Out-Null
+        $portable = Resolve-WritableRoot (Get-DataRootCandidate -Explicit '' -ScriptRoot $scriptRoot -TempRoot $tempRoot)
+        if (-not $portable.Resolved) { throw 'A writable launcher folder did not resolve to a portable data root.' }
+        if ($portable.Kind -ne 'portable') { throw "Expected the portable data root, got '$($portable.Kind)'." }
+        if ($portable.Path -ne (Join-Path $scriptRoot 'Data')) { throw "Portable data root landed in the wrong place: $($portable.Path)" }
+
+        # An explicit -DataRoot outranks the portable default.
+        $explicitPath = Join-Path $testRoot 'explicit'
+        $explicit = Resolve-WritableRoot (Get-DataRootCandidate -Explicit $explicitPath -ScriptRoot $scriptRoot -TempRoot $tempRoot)
+        if ($explicit.Kind -ne 'explicit' -or $explicit.Path -ne $explicitPath) { throw 'An explicit data root did not take priority.' }
+
+        # A file where the directory should be makes the primary location
+        # unusable without needing ACL manipulation.
+        $blockedRoot = Join-Path $testRoot 'blocked'
+        New-Item -ItemType Directory -Path $blockedRoot -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $blockedRoot 'Data') -Value 'not a directory' -Encoding ASCII
+        $fallback = Resolve-WritableRoot (Get-DataRootCandidate -Explicit '' -ScriptRoot $blockedRoot -TempRoot $tempRoot)
+        if (-not $fallback.Resolved) { throw 'An unusable portable folder did not fall back at all.' }
+        if ($fallback.Kind -ne 'temp') { throw "Expected the temp fallback, got '$($fallback.Kind)'." }
+        if ($fallback.Path -ne (Join-Path $tempRoot 'DLSS5-Guide-Launcher')) { throw "Fallback landed in the wrong place: $($fallback.Path)" }
+        if (-not (Test-Path -LiteralPath $fallback.Path -PathType Container)) { throw 'The fallback data root was not actually created.' }
+        if (Test-DirectoryUsable $fallback.Path) { throw 'The fallback data root is not writable.' }
+        $rejected = @($fallback.Attempts | Where-Object { $_.Result -ne 'usable' })
+        if ($rejected.Count -ne 1) { throw 'The rejected portable location was not recorded for the log.' }
+
+        # Local App Data must never appear, whatever the profile looks like.
+        foreach ($attempt in $fallback.Attempts) {
+            if ($attempt.Path -match '(?i)AppData\\Local\\DLSS5-Guide-Launcher') { throw 'A candidate resolved into Local App Data.' }
+        }
+
+        # A null or empty %LOCALAPPDATA% is now irrelevant, and an invalid or
+        # exhausted candidate list must report rather than throw.
+        $none = Resolve-WritableRoot (Get-DataRootCandidate -Explicit '' -ScriptRoot '' -TempRoot '')
+        if ($none.Resolved -or $none.Path) { throw 'An empty candidate list did not report an unresolved root.' }
+        $invalid = Test-DirectoryUsable ([string][char]0x0001 + ':\\nope')
+        if (-not $invalid) { throw 'An invalid path was reported as usable.' }
+
+        Write-AppLog 'Portable data-root selection and fallback tests passed.' 'OK'
+    }
+    finally {
+        if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Test-NoAdminHelpers {
     $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('DLSS5-Launcher-NoAdmin-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
@@ -1242,6 +1436,10 @@ function Show-MainWindow {
     $footer.BackColor = $colors.Header
     $form.Controls.Add($footer)
     $footerHint = & $newLabel $footer 'Step 1 of 4' 24 25 390 24 9 $false $colors.Muted
+    # The active data root is shown on every page: when something goes wrong the
+    # user needs to know where to look without being told to hunt for it.
+    $dataRootText = if ($script:ActiveDataRoot) { 'Data and logs: ' + $script:ActiveDataRoot } else { 'Data and logs: unavailable - no writable folder was found' }
+    $dataRootLabel = & $newLabel $footer $dataRootText 24 48 490 20 8 $false $colors.Muted
     $backButton = & $newButton $footer 'Back' 532 16 126 42 'Secondary'
     $nextButton = & $newButton $footer 'Continue' 672 16 154 42 'Primary'
     $progress = New-Object System.Windows.Forms.ProgressBar
@@ -1446,6 +1644,8 @@ function Show-MainWindow {
     $toolTip.SetToolTip($verifyButton,'Download and verify remote dependencies now, without installing them.')
     $toolTip.SetToolTip($rollback,'Restore the most recent backup for the selected game.')
     $toolTip.SetToolTip($nextButton,'Continue to the next guided step.')
+    if ($script:LogPath) { $toolTip.SetToolTip($openLog,('Open the current log: ' + $script:LogPath)) }
+    $toolTip.SetToolTip($dataRootLabel,$dataRootText)
 
     $setStatus = {
         param([string]$Text, [string]$Kind = 'Info')
@@ -1701,12 +1901,17 @@ function Show-MainWindow {
     [void]$form.ShowDialog()
 }
 
+if (-not (Initialize-AppLogging)) {
+    Write-Warning 'The launcher could not open its own log file. Startup continues; the bootstrap log records what happens next.'
+}
 Initialize-AppStorage
 Write-AppLog "$($script:AppName) v$($script:Version) started."
+Write-DataRootLog
 
 if ($SelfTest) {
     Test-DecisionMatrix
     Test-BackupRoundTrip
+    Test-PortableStorage
     Test-NoAdminHelpers
     exit 0
 }
