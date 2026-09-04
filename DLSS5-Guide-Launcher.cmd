@@ -269,13 +269,14 @@ call :log "  Command shape: powershell.exe -NoLogo -NoProfile -ExecutionPolicy B
 call :log "  Argument values are intentionally not logged."
 if not defined PS_OUT goto :run_unredirected
 "%PS_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -File "%APP_SCRIPT%" %* > "%PS_OUT%" 2>&1
+set "EXIT_CODE=%ERRORLEVEL%"
 goto :run_finished
 
 :run_unredirected
 "%PS_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -STA -File "%APP_SCRIPT%" %*
+set "EXIT_CODE=%ERRORLEVEL%"
 
 :run_finished
-set "EXIT_CODE=%ERRORLEVEL%"
 call :log "Stage 5: the application exited with code %EXIT_CODE%."
 call :append_ps_output "application"
 call :report_startup_sentinel
